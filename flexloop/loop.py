@@ -83,6 +83,47 @@ class Log:
       else:
         self.log(logname, value, step)
 
+# class FallbackLog:
+#   def __init__(self, path):
+#     self.path = path
+#     self.callbacks = {}
+
+#   def add(self, **kwargs):
+#     for key, val in kwargs.items():
+#       self.callbacks[key] = val
+#     return self
+
+#   def add_scalar(name, item, step):
+
+
+#   def log(self, name, item, step):
+#     if isinstance(item, float) or item.ndim == 0:
+#       self.writer.add_scalar(name, float(item), step)
+#     if isinstance(item, (np.ndarray, jnp.ndarray, jnp.DeviceArray)):
+#       if item.ndim == 1:
+#         item = item.mean()
+#         self.writer.add_scalar(name, float(item), step)
+#       if item.ndim in (2, 3):
+#         self.writer.add_image(name, item, step)
+#       if item.ndim == 4:
+#         self.writer.add_images(name, item, step)
+
+#   def loggables(self, name, aux, step, path=None):
+#     path = path or []
+#     path = path + [name]
+#     for key, value in aux.items():
+#       logname = ".".join(path + [key])
+#       if isinstance(value, dict):
+#         if len(value) == 2 and "marked" in value:
+#           del value["marked"]
+#           kind, val = value.popitem()
+#           if kind in self.callbacks:
+#             self.callbacks[kind](self.writer, logname, val, step)
+#         else:
+#           self.loggables(key, value, step, path=path)
+#       else:
+#         self.log(logname, value, step)
+
 def loggable(name, item):
   return {"marked": 1, name: item}
 
@@ -147,7 +188,7 @@ def single_update_stepgrad(step, per_item_transform: optax.GradientTransformatio
   return inner
 
 def update_step(step, optimizer: optax.GradientTransformation, accumulate=None, multigpu=False,
-                per_item_transform=None):
+                per_item_transform=None, jit=True):
   stepgrad = jax.value_and_grad(step, 0, has_aux=True)
   if per_item_transform is not None:
     stepgrad = single_update_stepgrad(
@@ -177,7 +218,9 @@ def update_step(step, optimizer: optax.GradientTransformation, accumulate=None, 
     aux["gradients"] = loggable("gradients", grad)
     aux["parameters"] = loggable("parameters", params)
     return loss, aux, params, opt_state
-  return BakedStep(jax.jit(inner))
+  if jit:
+    return BakedStep(jax.jit(inner))
+  return BakedStep(inner)
 
 class UpdateStep:
   pass
@@ -224,6 +267,7 @@ class TrainingLoop:
                accumulate=None, multigpu=False,
                per_item_transform=None,
                stage=None,
+               jit=True,
                node_id=0):
     self.log = log
     self.checkpoint = checkpoint
@@ -237,6 +281,7 @@ class TrainingLoop:
     self.step_id = 0
     self.max_steps = max_steps
     self.stage = stage
+    self.jit = jit
     self.steps = {}
     self.valid_steps = {}
 
@@ -256,31 +301,37 @@ class TrainingLoop:
       else:
         self.steps[name] = update_step(
           step, self.optimizer, accumulate=self.accumulate,
-          multigpu=self.multigpu, per_item_transform=self.per_item_transform
+          multigpu=self.multigpu, per_item_transform=self.per_item_transform,
+          jit=self.jit
         )
     for name, step in self.valid_steps.items():
       self.valid_steps[name] = jax.jit(step)
 
-  def train(self, params, opt_state, key, data, valid=None, aux_state=None, multi_opt=False):
+  def train(self, params, opt_state, key, data, valid=None, aux_state=None, multi_opt=False, batch_step=False):
     self.bake_steps()
     aux_state = aux_state or {}
     for idx in range(self.step_id, self.max_steps):
       batch = data.next()
       for name, item in batch.items():
+        if batch_step:
+          item["step_id"] = self.step_id
         key, subkey = jax.random.split(key, 2)
         step = self.steps[name]
         if isinstance(step, StagedStep):
           step = step.func(self.stage(self.step_id))
         if isinstance(step, Step):
           if self.node_id == 0:
-            params, opt_state, aux_state = step(
+            update = step(
               params, opt_state, aux_state, subkey, item
             )
+            params, opt_state, aux_state = update
         else:
           if multi_opt:
-            loss, aux, params, opt_state[name] = step(params, opt_state[name], subkey, item)
+            update = step(params, opt_state[name], subkey, item)
+            loss, aux, params, opt_state[name] = update
           else:
-            loss, aux, params, opt_state = step(params, opt_state, subkey, item)
+            update = step(params, opt_state, subkey, item)
+            loss, aux, params, opt_state = update
           if self.node_id == 0:
             self.log.log(name, loss, self.step_id)
             self.log.loggables(name, aux, self.step_id)
@@ -288,6 +339,8 @@ class TrainingLoop:
         if valid is not None and self.step_id % self.valid_interval == 0:
           batch = valid.next()
           for name, item in batch.items():
+            if batch_step:
+              item["step_id"] = self.step_id
             key, subkey = jax.random.split(key, 2)
             loss, aux = self.valid_steps[name](params, subkey, item)
             if self.node_id == 0:

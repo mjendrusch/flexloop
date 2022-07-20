@@ -6,7 +6,7 @@ class OptionType:
     self.type = parser or type(self.default)
     self.kwargs = kwargs
 
-def parse_options(description, **kwargs):
+def option_parser(description, **kwargs):
   parser = argparse.ArgumentParser(description=description)
   for name in kwargs:
     default = kwargs[name]
@@ -23,5 +23,8 @@ def parse_options(description, **kwargs):
       type=dtype, required=False,
       **argparse_kwargs
     )
-  return parser.parse_args()
+  return parser
 
+def parse_options(description, **kwargs):
+  parser = option_parser(description, **kwargs)
+  return parser.parse_args()
