@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import functools
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 import numpy as np
 import pickle
 import jax
@@ -9,6 +9,30 @@ import jax.numpy as jnp
 import haiku as hk
 from torch.utils.tensorboard import SummaryWriter
 import optax
+
+try:
+  import alpa
+  def alpa_jit(func):
+    return alpa.parallelize(func, donate_argnums=(0, 1, 2), batch_argnums=(3,))
+  _HAS_ALPA = True
+except:
+  _HAS_ALPA = False
+
+NUM_DEVICES = len(jax.devices())
+def pmap_jit(func):
+  def inner(params, opt_state, key, data):
+    data = jax.tree_map(lambda x: x.reshape(NUM_DEVICES, -1, *x.shape[1:]), data)
+    def debug_print(x):
+      print(x.shape)
+      return x
+    data = jax.tree_map(debug_print, data) # FIXME
+    key = jax.random.split(key, NUM_DEVICES)
+    return jax.pmap(
+      func, axis_name="batch_ax",
+      in_axes=(None, None, 0, 0),
+      out_axes=(None, None, None, None),
+      donate_argnums=(0, 1))(params, opt_state, key, data)
+  return inner
 
 class Checkpoint:
   def __init__(self, path, save_every=600) -> None:
@@ -18,12 +42,12 @@ class Checkpoint:
 
   def checkpoint(self, params, step_id):
     with open(f"{self.path}/checkpoint-{step_id}.jax", "wb") as f:
-      pickle.dump(params, f)
+      pickle.dump(cast_float(params, jnp.float32), f)
 
   def save_aux(self, params, opt_state, aux_state, key, step_id):
     with open(f"{self.path}/save.jax", "wb") as f:
       pickle.dump(dict(
-        params=params,
+        params=cast_float(params, jnp.float32),
         opt_state=opt_state,
         aux_state=aux_state,
         key=key,
@@ -140,15 +164,19 @@ def batch_from_pmap(batch):
 
 def make_stepgrad_multigpu(stepgrad):
   def inner(params, key, item):
-    item = batch_to_pmap(item)
-    (loss, aux), grad = jax.pmap(
-      stepgrad, in_axes=(None, None, 0), out_axes=0,
-      axis_name="i"
-    )(params, key, item)
-    loss, aux = batch_from_pmap((loss, aux))
-    loss = loss.mean()
-    grad = jax.tree_map(lambda x: x.mean(axis=0), grad)
+    (loss, aux), grad = stepgrad(params, key, item)
+    loss = jax.lax.pmean(loss.mean(), axis_name="batch_ax")
+    grad = jax.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch_ax"), grad)
     return (loss, aux), grad
+    # item = batch_to_pmap(item)
+    # (loss, aux), grad = jax.pmap(
+    #   stepgrad, in_axes=(None, None, 0), out_axes=0,
+    #   axis_name="i"
+    # )(params, key, item)
+    # loss, aux = batch_from_pmap((loss, aux))
+    # loss = loss.mean()
+    # grad = jax.tree_map(lambda x: x.mean(axis=0), grad)
+    # return (loss, aux), grad
   return inner
 
 def cast_float(data, dtype=jnp.bfloat16):
@@ -187,40 +215,88 @@ def single_update_stepgrad(step, per_item_transform: optax.GradientTransformatio
     return (loss.mean(axis=0), aux), grad
   return inner
 
+def alpa_stepgrad(step, per_item_transform: optax.GradientTransformation):
+  stepgrad = alpa.value_and_grad(step, 0, has_aux=True)
+  def inner(params, key, item):
+    transform_state = per_item_transform.init(params)
+    def accumulate_fun(item):
+        (loss, aux), grad = stepgrad(params, key, item)
+        grad, _ = per_item_transform.update(grad, transform_state)
+        return (loss, aux), grad
+    update = jax.vmap(accumulate_fun, 0, 0)(
+      jax.tree_map(lambda x: x[:, None], item))
+    (loss, aux) = jax.tree_map(
+      lambda x: x.reshape(-1, *x.shape[2:]),
+      update[0]
+    )
+    grad = jax.tree_map(lambda x: x.mean(axis=0), update[1])
+    return (loss.mean(axis=0), aux), grad
+  return inner
+
 def update_step(step, optimizer: optax.GradientTransformation, accumulate=None, multigpu=False,
-                per_item_transform=None, jit=True):
+                per_item_transform=None, with_state=False, jit=True):
+  if with_state:
+    raw_step = step
+    def with_state_step(params, state, key, item):
+      (total, aux), state = raw_step(params, state, key, item)
+      return total, (state, aux)
+    step = with_state_step
   stepgrad = jax.value_and_grad(step, 0, has_aux=True)
   if per_item_transform is not None:
     stepgrad = single_update_stepgrad(
       step, per_item_transform=per_item_transform)
-  if multigpu:
+  if (accumulate is not None) and (accumulate > 1):
+    stepgrad = accumulate_stepgrad(stepgrad, count=accumulate)
+  if _HAS_ALPA and multigpu:
+    stepgrad = alpa.value_and_grad(step, 0, has_aux=True)
+  elif multigpu:
     stepgrad = make_stepgrad_multigpu(stepgrad)
   def inner(params, opt_state, key, item):
-    if accumulate is not None and accumulate > 1:
-      def accumulate_fun(item):
-        (loss, aux), grad = stepgrad(params, key, item)
-        return (loss, aux), grad
-      item = jax.tree_map(
-        lambda x: x.reshape(accumulate, -1, *x.shape[1:]),
-        item
-      )
-      update = jax.lax.map(accumulate_fun, item)
-      (loss, aux), grad = jax.tree_map(
-        lambda x: x.reshape(-1, *x.shape[2:]),
-        update
-      )
-      loss = loss.mean()
-      grad = jax.tree_map(lambda x: x.mean(axis=0), grad)
-    else:
-      (loss, aux), grad = stepgrad(params, key, item)
+    (loss, aux), grad = stepgrad(params, key, item)
     updates, opt_state = optimizer.update(grad, opt_state, params=params)
     params = optax.apply_updates(params, updates)
     aux["gradients"] = loggable("gradients", grad)
     aux["parameters"] = loggable("parameters", params)
     return loss, aux, params, opt_state
+  if with_state:
+    def inner(ps, opt_state, key, item):
+      params, state = ps
+      (loss, (state, aux)), grad = stepgrad(params, state, key, item)
+      updates, opt_state = optimizer.update(grad, opt_state, params=params)
+      params = optax.apply_updates(params, updates)
+      aux["gradients"] = loggable("gradients", grad)
+      aux["parameters"] = loggable("parameters", params)
+      return loss, aux, (params, state), opt_state
   if jit:
-    return BakedStep(jax.jit(inner))
-  return BakedStep(inner)
+    precompile = True
+    jitfunction = jax.jit
+    if _HAS_ALPA and multigpu:
+      precompile = False
+      jitfunction = alpa_jit
+    elif multigpu:
+      precompile = False
+      jitfunction = pmap_jit
+    result = BakedStep(jitfunction(inner))
+    result.initialised = not precompile
+    return result
+  result = BakedStep(inner)
+  result.initialised = True
+  return result
+
+def accumulate_stepgrad(stepgrad, count=8):
+  def inner(params, key, data):
+    def body(carry, xs):
+      item, key = xs
+      (loss, aux), grad = stepgrad(params, key, item)
+      carry = jax.tree_map(lambda x, y: x + y / count, carry, grad)
+      return carry, (loss, aux)
+    init = jax.tree_map(lambda x: jnp.zeros_like(x), params)
+    data = jax.tree_map(lambda x: x.reshape(count, -1, *x.shape[1:]), data)
+    grad, (loss, aux) = jax.lax.scan(body, init, (data, jax.random.split(key, count)))
+    loss = loss.mean()
+    aux = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), aux)
+    return (loss, aux), grad
+  return inner
 
 class UpdateStep:
   pass
@@ -232,8 +308,30 @@ class StagedStep(UpdateStep):
 @dataclass
 class BakedStep(UpdateStep):
   func: Any
+  initialised = False
   def __call__(self, *args, **kwargs):
+    # def typename(x):
+    #   if isinstance(x, jnp.ndarray):
+    #     return f"darray({x.shape}, {x.dtype})"
+    #   elif isinstance(x, np.ndarray):
+    #     return f"carray({x.shape}, {x.dtype})"
+    #   else:
+    #     return type(x)
+    # print("step called", flush=True)
+    # print(self.func._cache_size(), flush=True)
+    # print(tree_map_aux(typename, args[-1]))
+    # # print(tree_map_aux(typename, kwargs))
+    if not self.initialised:
+      self.initialised = True
+      self.func = self.func.lower(*args, **kwargs).compile()
     return self.func(*args, **kwargs)
+
+def tree_map_aux(func, x):
+  if isinstance(x, (list, tuple)):
+    return [type(x)] + [tree_map_aux(func, i) for i in x]
+  if isinstance(x, dict):
+    return {n: tree_map_aux(func, i) for n, i in x.items()}
+  return func(x)
 
 def staged_update_step(step, optimizer, accumulate=None, multigpu=False,
                        per_item_transform=None):
@@ -265,7 +363,7 @@ class TrainingLoop:
                optimizer=None, max_steps=int(1e7),
                valid_interval=100, checkpoint_interval=1000,
                accumulate=None, multigpu=False,
-               per_item_transform=None,
+               per_item_transform=None, with_state=False,
                stage=None,
                jit=True,
                node_id=0):
@@ -282,6 +380,7 @@ class TrainingLoop:
     self.max_steps = max_steps
     self.stage = stage
     self.jit = jit
+    self.with_state = with_state
     self.steps = {}
     self.valid_steps = {}
 
@@ -299,15 +398,19 @@ class TrainingLoop:
       elif isinstance(step, UpdateStep):
         pass
       else:
+        print("ACCUMULATE:", self.accumulate, flush=True)
         self.steps[name] = update_step(
           step, self.optimizer, accumulate=self.accumulate,
           multigpu=self.multigpu, per_item_transform=self.per_item_transform,
-          jit=self.jit
+          jit=self.jit, with_state=self.with_state
         )
     for name, step in self.valid_steps.items():
       self.valid_steps[name] = jax.jit(step)
 
-  def train(self, params, opt_state, key, data, valid=None, aux_state=None, multi_opt=False, batch_step=False):
+  # TODO: for some reason the first step runs & compiles twice
+  # fix it
+  def train(self, params, opt_state, key, data, valid=None, aux_state=None,
+            multi_opt=False, batch_step=False):
     self.bake_steps()
     aux_state = aux_state or {}
     for idx in range(self.step_id, self.max_steps):
@@ -327,14 +430,15 @@ class TrainingLoop:
             params, opt_state, aux_state = update
         else:
           if multi_opt:
-            update = step(params, opt_state[name], subkey, item)
-            loss, aux, params, opt_state[name] = update
+            loss, aux, params, opt_state[name] = step(params, opt_state[name], subkey, item)
+            # loss, aux, params, opt_state[name] = update
           else:
-            update = step(params, opt_state, subkey, item)
-            loss, aux, params, opt_state = update
+            loss, aux, params, opt_state = step(params, opt_state, subkey, item)
+            # loss, aux, params, opt_state = update
           if self.node_id == 0:
             self.log.log(name, loss, self.step_id)
             self.log.loggables(name, aux, self.step_id)
+        # del update
       if self.node_id == 0:
         if valid is not None and self.step_id % self.valid_interval == 0:
           batch = valid.next()
