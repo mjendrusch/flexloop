@@ -69,13 +69,13 @@ def direct_collate(batch, level=0):
     return np.array(batch)
 
 class BatchDistribution(DataDistribution):
-  def __init__(self, datasets, **kwargs):
+  def __init__(self, datasets, accumulate=1, **kwargs):
     self.data_loaders = [
       (name, iter(DataLoader(
         data, sampler=InfiniteSampler(data),
         drop_last=True, collate_fn=direct_collate,
         worker_init_fn=_worker_init_function,
-        batch_size=1,
+        batch_size=accumulate,
         **kwargs
       )))
       for name, data in datasets
@@ -90,6 +90,6 @@ class BatchDistribution(DataDistribution):
 def _worker_init_function(worker_id):
   torch_seed = torch.initial_seed()
   random.seed(torch_seed + worker_id)
-  if torch_seed >= 2**30:  # make sure torch_seed + workder_id < 2**32
+  if torch_seed >= 2**30:  # make sure torch_seed + worker_id < 2**32
     torch_seed = torch_seed % 2**30
   np.random.seed(torch_seed + worker_id)

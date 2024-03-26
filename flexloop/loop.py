@@ -22,16 +22,28 @@ NUM_DEVICES = len(jax.devices())
 def pmap_jit(func):
   def inner(params, opt_state, key, data):
     data = jax.tree_map(lambda x: x.reshape(NUM_DEVICES, -1, *x.shape[1:]), data)
-    def debug_print(x):
-      print(x.shape)
-      return x
-    data = jax.tree_map(debug_print, data) # FIXME
+    key, fixed_key = jax.random.split(key, 2)
+    # FIXME
+    #data["fixed_key"] = jnp.repeat(fixed_key[None], NUM_DEVICES, axis=0)
     key = jax.random.split(key, NUM_DEVICES)
     return jax.pmap(
       func, axis_name="batch_ax",
       in_axes=(None, None, 0, 0),
       out_axes=(None, None, None, None),
       donate_argnums=(0, 1))(params, opt_state, key, data)
+  return inner
+
+def valid_pmap_jit(func):
+  def inner(params, key, data):
+    data = jax.tree_map(lambda x: x.reshape(NUM_DEVICES, -1, *x.shape[1:]), data)
+    key, fixed_key = jax.random.split(key, 2)
+    # FIXME
+    #data["fixed_key"] = jnp.repeat(fixed_key[None], NUM_DEVICES, axis=0)
+    key = jax.random.split(key, NUM_DEVICES)
+    return jax.pmap(
+      func, axis_name="batch_ax",
+      in_axes=(None, 0, 0),
+      out_axes=(None, None))(params, key, data)
   return inner
 
 class Checkpoint:
@@ -48,8 +60,8 @@ class Checkpoint:
     with open(f"{self.path}/save.jax", "wb") as f:
       pickle.dump(dict(
         params=cast_float(params, jnp.float32),
-        opt_state=opt_state,
-        aux_state=aux_state,
+        opt_state=cast_float(opt_state, jnp.float32),
+        aux_state=cast_float(aux_state, jnp.float32),
         key=key,
         step_id=step_id
       ), f)
@@ -162,28 +174,37 @@ def batch_from_pmap(batch):
     return data.reshape(-1, *data.shape[2:])
   return jax.tree_map(_reshape, batch)
 
+def pmean_scalars(x):
+  if isinstance(x, jnp.ndarray) and \
+      jnp.issubdtype(x.dtype, jnp.floating) and \
+      x.ndim == 0:
+    return jax.lax.pmean(x.astype(jnp.float32), axis_name="batch_ax")
+
 def make_stepgrad_multigpu(stepgrad):
-  def inner(params, key, item):
-    (loss, aux), grad = stepgrad(params, key, item)
-    loss = jax.lax.pmean(loss.mean(), axis_name="batch_ax")
-    grad = jax.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch_ax"), grad)
+  def inner(*args):
+    (loss, aux), grad = stepgrad(*args)
+    # average all loss-like scalars over the whole superbatch
+    aux = jax.tree_map(pmean_scalars, aux)
+    loss = jax.lax.pmean(loss.mean().astype(jnp.float32), axis_name="batch_ax")
+    grad = jax.tree_map(lambda x: jax.lax.pmean(x.astype(jnp.float32), axis_name="batch_ax"), grad)
     return (loss, aux), grad
-    # item = batch_to_pmap(item)
-    # (loss, aux), grad = jax.pmap(
-    #   stepgrad, in_axes=(None, None, 0), out_axes=0,
-    #   axis_name="i"
-    # )(params, key, item)
-    # loss, aux = batch_from_pmap((loss, aux))
-    # loss = loss.mean()
-    # grad = jax.tree_map(lambda x: x.mean(axis=0), grad)
-    # return (loss, aux), grad
+  return inner
+
+def make_valid_multigpu(valid):
+  def inner(*args):
+    loss, aux = valid(*args)
+    loss = jax.lax.pmean(loss.mean().astype(jnp.float32), axis_name="batch_ax")
+    aux = jax.tree_map(pmean_scalars, aux)
+    return loss, aux
   return inner
 
 def cast_float(data, dtype=jnp.bfloat16):
     def _cast_aux(data):
         if isinstance(data, jnp.ndarray) and \
            jnp.issubdtype(data.dtype, jnp.floating):
-            return data.astype(dtype)
+          if data.dtype is not dtype:
+            data = data.astype(dtype)
+          return data
         return data
     return jax.tree_map(_cast_aux, data)
 
@@ -246,7 +267,7 @@ def update_step(step, optimizer: optax.GradientTransformation, accumulate=None, 
     stepgrad = single_update_stepgrad(
       step, per_item_transform=per_item_transform)
   if (accumulate is not None) and (accumulate > 1):
-    stepgrad = accumulate_stepgrad(stepgrad, count=accumulate)
+    stepgrad = accumulate_stepgrad(stepgrad, count=accumulate, with_state=with_state)
   if _HAS_ALPA and multigpu:
     stepgrad = alpa.value_and_grad(step, 0, has_aux=True)
   elif multigpu:
@@ -283,18 +304,29 @@ def update_step(step, optimizer: optax.GradientTransformation, accumulate=None, 
   result.initialised = True
   return result
 
-def accumulate_stepgrad(stepgrad, count=8):
-  def inner(params, key, data):
+def accumulate_stepgrad(stepgrad, count=8, with_state=False):
+  def inner(*args):
+    params = args[0]
+    key = args[-2]
+    data = args[-1]
     def body(carry, xs):
       item, key = xs
-      (loss, aux), grad = stepgrad(params, key, item)
-      carry = jax.tree_map(lambda x, y: x + y / count, carry, grad)
+      (loss, aux), grad = stepgrad(*args[:-2], key, item)
+      carry = jax.tree_map(lambda x, y: x + y, carry, grad)
       return carry, (loss, aux)
     init = jax.tree_map(lambda x: jnp.zeros_like(x), params)
     data = jax.tree_map(lambda x: x.reshape(count, -1, *x.shape[1:]), data)
     grad, (loss, aux) = jax.lax.scan(body, init, (data, jax.random.split(key, count)))
+    grad = jax.tree_map(lambda x: x / count, grad)
+    if with_state:
+      state, aux = aux
+      def slice_state(x):
+        return x[0]
+      state = jax.tree_map(slice_state, state)
     loss = loss.mean()
     aux = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), aux)
+    if with_state:
+      aux = (state, aux)
     return (loss, aux), grad
   return inner
 
@@ -362,7 +394,7 @@ class TrainingLoop:
   def __init__(self, log=None, checkpoint=None,
                optimizer=None, max_steps=int(1e7),
                valid_interval=100, checkpoint_interval=1000,
-               accumulate=None, multigpu=False,
+               accumulate=None, multigpu=False, valid_multigpu=False,
                per_item_transform=None, with_state=False,
                stage=None,
                jit=True,
@@ -373,6 +405,7 @@ class TrainingLoop:
     self.checkpoint_interval = checkpoint_interval
     self.accumulate = accumulate
     self.multigpu = multigpu
+    self.valid_multigpu = valid_multigpu
     self.node_id = node_id
     self.optimizer = optimizer
     self.per_item_transform = per_item_transform
@@ -399,13 +432,21 @@ class TrainingLoop:
         pass
       else:
         print("ACCUMULATE:", self.accumulate, flush=True)
+        optimizer = self.optimizer
+        if isinstance(optimizer, dict):
+          optimizer = optimizer[name]
         self.steps[name] = update_step(
-          step, self.optimizer, accumulate=self.accumulate,
+          step, optimizer, accumulate=self.accumulate,
           multigpu=self.multigpu, per_item_transform=self.per_item_transform,
           jit=self.jit, with_state=self.with_state
         )
     for name, step in self.valid_steps.items():
-      self.valid_steps[name] = jax.jit(step)
+      if self.valid_multigpu:
+        step = make_valid_multigpu(step)
+        step = valid_pmap_jit(step)
+      else:
+        step = jax.jit(step)
+      self.valid_steps[name] = step
 
   # TODO: for some reason the first step runs & compiles twice
   # fix it
@@ -414,10 +455,16 @@ class TrainingLoop:
     self.bake_steps()
     aux_state = aux_state or {}
     for idx in range(self.step_id, self.max_steps):
+      t0 = time.time()
       batch = data.next()
+      t1 = time.time()
       for name, item in batch.items():
         if batch_step:
-          item["step_id"] = self.step_id
+          item["step_id"] = jnp.array([self.step_id]) # FIXME: this was a scalar
+          # NOTE: to ensure that step_id can be mapped and pmapped over in
+          # accumulation & multigpu modes, we replicate it accumulate * NUM_DEVICES times.
+          if self.accumulate > 1 or self.multigpu:
+            item["step_id"] = jnp.ones((self.accumulate * NUM_DEVICES,), dtype=jnp.int32) * self.step_id
         key, subkey = jax.random.split(key, 2)
         step = self.steps[name]
         if isinstance(step, StagedStep):
@@ -439,14 +486,19 @@ class TrainingLoop:
             self.log.log(name, loss, self.step_id)
             self.log.loggables(name, aux, self.step_id)
         # del update
+      t2 = time.time()
+      print(f"Step {idx}. Load time {t1 - t0}. Run time {t2 - t1}. Total {t2 - t0}.")
       if self.node_id == 0:
         if valid is not None and self.step_id % self.valid_interval == 0:
           batch = valid.next()
           for name, item in batch.items():
             if batch_step:
-              item["step_id"] = self.step_id
+              item["step_id"] = jnp.array([self.step_id])
             key, subkey = jax.random.split(key, 2)
-            loss, aux = self.valid_steps[name](params, subkey, item)
+            if self.with_state:
+              (loss, aux), _ = self.valid_steps[name](params[0], params[1], subkey, item)
+            else:
+              loss, aux = self.valid_steps[name](params, subkey, item)
             if self.node_id == 0:
               self.log.log(name, loss, self.step_id)
               self.log.loggables(name, aux, self.step_id)
