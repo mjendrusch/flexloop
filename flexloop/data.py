@@ -87,6 +87,52 @@ class BatchDistribution(DataDistribution):
       for name, it in self.data_loaders  
     }
 
+class BatchStream:
+    def __init__(self, dataset, num_workers=0, timeout=120,
+                 accumulate=1, prefetch_factor=2):
+        self.dataset = dataset
+        self.num_workers = num_workers
+        self.timeout = timeout
+        self.accumulate = accumulate
+        self.prefetch_factor = prefetch_factor
+        self.dataloader, self.iter = self.setup_dataloader()
+
+    def __iter__(self):
+        while True:
+            try:
+                yield next(self.iter)
+            except TimeoutError:
+                self.dataloader, self.iter = self.setup_dataloader()
+            except StopIteration:
+                self.iter = iter(self.dataloader)
+
+    def setup_dataloader(self):
+        dl = DataLoader(
+            self.dataset, batch_size=self.accumulate, shuffle=False,
+            prefetch_factor=self.prefetch_factor, persistent_workers=True,
+            drop_last=False, num_workers=self.num_workers, timeout=self.timeout,
+            collate_fn=np_collate, worker_init_fn=_worker_init_function)
+        return dl, iter(dl)
+
+class BatchStreamDistribution:
+    def __init__(self, datasets, accumulate=1, **kwargs):
+        self.data_loaders = [
+            (name, iter(BatchStream(data, accumulate=accumulate, **kwargs)))
+            for name, data in datasets
+        ]
+
+    def next(self):
+        return {
+            name: next(it)
+            for name, it in self.data_loaders  
+        }
+
+def np_collate(items):
+    return {
+        key: np.concatenate([i[key] for i in items], axis=0)
+        for key in items[0].keys()
+    }
+
 def _worker_init_function(worker_id):
   torch_seed = torch.initial_seed()
   random.seed(torch_seed + worker_id)

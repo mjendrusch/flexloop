@@ -342,17 +342,6 @@ class BakedStep(UpdateStep):
   func: Any
   initialised = False
   def __call__(self, *args, **kwargs):
-    # def typename(x):
-    #   if isinstance(x, jnp.ndarray):
-    #     return f"darray({x.shape}, {x.dtype})"
-    #   elif isinstance(x, np.ndarray):
-    #     return f"carray({x.shape}, {x.dtype})"
-    #   else:
-    #     return type(x)
-    # print("step called", flush=True)
-    # print(self.func._cache_size(), flush=True)
-    # print(tree_map_aux(typename, args[-1]))
-    # # print(tree_map_aux(typename, kwargs))
     if not self.initialised:
       self.initialised = True
       self.func = self.func.lower(*args, **kwargs).compile()
