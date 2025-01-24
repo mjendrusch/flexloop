@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flexloop"
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["protein", "machine learning", "jax", "diffusion models"]
+authors = [{ name = "Michael A. Jendrusch", email = "michael.jendrusch@embl.de" }]
+maintainers = [{ name = "Michael A. Jendrusch", email = "michael.jendrusch@embl.de" }]
+description = "Minimalistic extensible training loop."
+readme = "README.md"
+
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "optax @ git+https://github.com/google-deepmind/optax.git",
+    "dm-haiku @ git+https://github.com/deepmind/dm-haiku"
+]
